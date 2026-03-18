@@ -1,0 +1,12 @@
+# Ignorar imágenes JPG
+*.jpg
+
+# Ignorar carpeta de caché de Python
+__pycache__/
+
+#Ingorar el database
+Data/
+data/
+
+# Ignorar archivos temporales
+*.log
