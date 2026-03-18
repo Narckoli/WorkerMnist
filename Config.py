@@ -7,7 +7,7 @@ import numpy as np
 class WorkerConfig:
     """Configuración del worker."""
     # Conexión al servidor
-    SERVER_IP: str = "192.168.0.4"
+    SERVER_IP: str = "192.168.61.230"
     PORT: int = 5000
     
     # Estado del worker
