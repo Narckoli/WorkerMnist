@@ -72,3 +72,19 @@ def backward(A2: np.ndarray, y: np.ndarray, cache: Tuple, weights: Dict[str, np.
         "W2": dW2,
         "b2": db2
     }
+
+# Función principal para entrenar una época
+def train_epoch(X_chunk: np.ndarray, 
+                y_chunk: np.ndarray, 
+                weights: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float]:
+    """Entrena una época con el chunk local."""
+    # Forward
+    A2, cache = forward(X_chunk, weights)
+    
+    # Calcular loss
+    loss = compute_loss(A2, y_chunk)
+    
+    # Backward
+    grads = backward(A2, y_chunk, cache, weights)
+    
+    return grads, loss

@@ -1,28 +1,78 @@
-# training.py
+# worker/training.py
+import time
 import numpy as np
-from typing import Dict, Tuple
 
-from Model import forward, compute_loss, backward
+from Communication import send_json, recv_json
+from Model import train_epoch
+from Metrics import metrics
 
-def train_epoch(X_chunk: np.ndarray, 
-                y_chunk: np.ndarray, 
-                weights: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float]:
-    """
-    Entrena una época con el chunk local.
-    Retorna: (gradientes, loss)
-    """
-    # Forward
-    A2, cache = forward(X_chunk, weights)
+async def training_loop(reader, writer, X_chunk, y_chunk, config):
+    """Bucle principal de entrenamiento del worker."""
     
-    # Calcular loss
-    loss = compute_loss(A2, y_chunk)
-    
-    # Backward
-    grads = backward(A2, y_chunk, cache, weights)
-    
-    return grads, loss
+    try:
+        while True:
+            # Recibir mensaje del servidor
+            data = await recv_json(reader)
+            
+            if data is None:
+                print("Conexión cerrada por el servidor")
+                break
 
-def verify_weights(weights: Dict[str, np.ndarray]) -> None:
-    """Verifica que los pesos sean válidos (debug)."""
-    total = sum(np.sum(np.abs(w)) for w in weights.values())
-    print(f"[DEBUG] Suma total de pesos: {total:.6f}")
+            msg_type = data.get("type")
+            
+            if msg_type == "weights":
+                epoch = data.get("epoch", "?")
+                print(f"\n>>> ÉPOCA {epoch} <<<")
+                
+                # Reconstruir pesos
+                weights = {
+                    "W1": np.array(data["W1"]),
+                    "b1": np.array(data["b1"]),
+                    "W2": np.array(data["W2"]),
+                    "b2": np.array(data["b2"])
+                }
+                
+                # Medir tiempo de entrenamiento
+                start_time = time.time()
+                
+                # Entrenar época
+                grads, loss = train_epoch(X_chunk, y_chunk, weights)
+                
+                epoch_time = time.time() - start_time
+                
+                print(f"✓ Loss calculada: {loss:.6f}")
+                print(f"✓ Tiempo: {epoch_time:.2f}s")
+                
+                # Guardar métricas locales
+                metrics.add_epoch_result(loss, epoch_time)
+                
+                # Enviar gradientes al servidor
+                await send_json(writer, {
+                    "type": "gradients",
+                    "grads": {
+                        "W1": grads["W1"].tolist(),
+                        "b1": grads["b1"].tolist(),
+                        "W2": grads["W2"].tolist(),
+                        "b2": grads["b2"].tolist()
+                    },
+                    "loss": float(loss)
+                })
+                
+                print("✓ Gradientes enviados al servidor")
+
+            elif msg_type == "training_complete":
+                print(f"\n{'='*50}")
+                print(data.get("message", "Entrenamiento finalizado"))
+                print(f"{'='*50}")
+                
+                # Mostrar resumen local
+                metrics.print_summary()
+                break
+
+            else:
+                print(f"⚠ Tipo de mensaje desconocido: {msg_type}")
+                
+    except Exception as e:
+        print(f"Error en training_loop: {e}")
+        import traceback
+        traceback.print_exc()
