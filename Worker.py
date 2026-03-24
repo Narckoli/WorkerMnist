@@ -1,80 +1,109 @@
-# worker/worker.py
+# worker.py (o main.py del worker)
 import asyncio
 import sys
 import os
 
-# Asegurar imports
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from Config import WorkerConfig
-from Communication import send_json, recv_json, connect_to_server
-from Dataset import load_mnist_dataset, extract_chunk
+# Asegúrate de tener los imports correctos
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from Communication import connect_to_server, send_json, recv_json
+from Config import WorkerConfig, config  # Importar tanto la clase como la instancia
+from Dataset import load_dataset_chunk
 from Training import training_loop
+from Model import init_local_weights
 
-async def start_worker():
+async def main():
     """Punto de entrada principal del worker."""
-    print("=" * 50)
-    print("WORKER DE ENTRENAMIENTO DISTRIBUIDO MNIST (ASYNC)")
-    print("=" * 50)
+    print("\n" + "="*60)
+    print("WORKER DE ENTRENAMIENTO DISTRIBUIDO")
+    print("="*60)
     
-    # Configuración
-    config = WorkerConfig.from_input()
+    # Configuración inicial - USAR LA CLASE WorkerConfig CORRECTAMENTE
+    temp_config = WorkerConfig.from_input()
+    config.SERVER_IP = temp_config.SERVER_IP
+    config.PORT = temp_config.PORT
     
-    # Cargar dataset
-    print("\nCargando dataset...")
-    X_train, y_train = load_mnist_dataset()
-
     # Conectar al servidor
     reader, writer = await connect_to_server(config.SERVER_IP, config.PORT)
     if not reader or not writer:
+        print("No se pudo establecer conexión con el servidor")
         return
-
+    
     try:
-        # Procesar mensajes iniciales
-        X_chunk = None
-        y_chunk = None
+        # 1. RECIBIR ID DEL WORKER
+        data = await recv_json(reader)
+        if not data or data.get("type") != "worker_id":
+            print("Error: No se recibió ID del servidor")
+            return
         
-        print("\n⏳ Esperando asignación de datos del servidor...")
+        config.worker_id = data["worker_id"]
+        print(f"\n✓ ID asignado: Worker {config.worker_id}")
         
-        while X_chunk is None:
-            data = await recv_json(reader)
-            if data is None:
-                print("❌ Conexión cerrada por el servidor")
-                return
-            
-            msg_type = data.get("type")
-            
-            if msg_type == "worker_id":
-                config.worker_id = data['worker_id']
-                print(f"✓ Mi ID asignado: Worker {config.worker_id}")
-            
-            elif msg_type == "dataset_chunk":
-                indices = data["indices"]
-                X_chunk, y_chunk = extract_chunk(X_train, y_train, indices)
-                print(f"✓ Chunk recibido: {len(indices)} muestras")
+        # 2. RECIBIR INFORMACIÓN DEL DATASET
+        data = await recv_json(reader)
+        if not data or data.get("type") != "dataset_info":
+            print("Error: No se recibió información del dataset")
+            return
         
-        # ===== IMPORTANTE: Enviar señal de READY =====
-        print("\n🚦 Worker listo para entrenar. Enviando señal READY al servidor...")
-        await send_json(writer, {"type": "worker_ready"})
-        print("✓ Señal READY enviada")
+        config.dataset_name = data["dataset_name"]
+        config.input_size = data["input_size"]
+        config.hidden_size = data.get("hidden_size", 128)
+        config.output_size = data.get("output_size", 10)
         
-        # Iniciar bucle de entrenamiento
-        print("\n🎯 Esperando inicio del entrenamiento...")
-        await training_loop(reader, writer, X_chunk, y_chunk, config)
+        print(f"\n📊 Información del dataset recibida:")
+        print(f"   Nombre: {config.dataset_name}")
+        print(f"   Input size: {config.input_size}")
+        print(f"   Hidden size: {config.hidden_size}")
+        print(f"   Output size: {config.output_size}")
         
-    except KeyboardInterrupt:
-        print("\n\n⛔ Worker interrumpido por el usuario")
+        # 3. RECIBIR CHUNK DE DATOS
+        data = await recv_json(reader)
+        if not data or data.get("type") != "dataset_chunk":
+            print("Error: No se recibió el chunk de datos")
+            return
+        
+        indices = data["indices"]
+        print(f"\n✓ Chunk recibido: {len(indices)} muestras")
+        
+        # Cargar el dataset localmente usando la información recibida
+        config.X_chunk, config.y_chunk = load_dataset_chunk(
+            config.dataset_name, 
+            indices
+        )
+        
+        print(f"✓ Datos cargados: X shape={config.X_chunk.shape}, y shape={config.y_chunk.shape}")
+        
+        # 4. INICIALIZAR PESOS LOCALES (estructura para gradientes)
+        config.local_weights_template = init_local_weights(
+            config.input_size, 
+            config.hidden_size, 
+            config.output_size
+        )
+        
+        # 5. ENVIAR CONFIRMACIÓN DE READY
+        await send_json(writer, {
+            "type": "worker_ready",
+            "worker_id": config.worker_id,
+            "dataset_name": config.dataset_name,
+            "samples": len(config.X_chunk)
+        })
+        print(f"\n✓ Worker listo para entrenar")
+        
+        # 6. INICIAR BUCLE DE ENTRENAMIENTO
+        config.print_info()
+        await training_loop(reader, writer, config)
+        
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ Error en worker: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        writer.close()
-        await writer.wait_closed()
-        print("🔌 Conexión cerrada")
+        if writer:
+            writer.close()
+            await writer.wait_closed()
+        print("\n🔌 Worker finalizado")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(start_worker())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Worker finalizado")
+        print("\n\n⚠ Worker interrumpido por el usuario")

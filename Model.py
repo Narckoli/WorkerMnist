@@ -1,71 +1,61 @@
-# model.py
+# model.py (worker)
 import numpy as np
 from typing import Dict, Tuple
 
-# ======================
-# Activaciones
-# ======================
+def init_local_weights(input_size: int, hidden_size: int, output_size: int) -> Dict[str, np.ndarray]:
+    """Inicializa la estructura de pesos para gradientes."""
+    # Solo la estructura, los valores no se usan realmente
+    return {
+        "W1": np.zeros((input_size, hidden_size)),
+        "b1": np.zeros(hidden_size),
+        "W2": np.zeros((hidden_size, output_size)),
+        "b2": np.zeros(output_size)
+    }
+
 def relu(Z: np.ndarray) -> np.ndarray:
+    """Función de activación ReLU."""
     return np.maximum(0, Z)
 
-def relu_derivative(Z: np.ndarray) -> np.ndarray:
-    return (Z > 0).astype(float)
-
 def softmax(Z: np.ndarray) -> np.ndarray:
+    """Softmax estable numéricamente."""
     expZ = np.exp(Z - np.max(Z, axis=1, keepdims=True))
     return expZ / np.sum(expZ, axis=1, keepdims=True)
 
-def one_hot(y: np.ndarray) -> np.ndarray:
-    oh = np.zeros((y.size, 10))
-    oh[np.arange(y.size), y] = 1
-    return oh
-
-# ======================
-# Forward
-# ======================
-def forward(X: np.ndarray, weights: Dict[str, np.ndarray]) -> Tuple[np.ndarray, Tuple]:
+def forward(X: np.ndarray, weights: Dict[str, np.ndarray]) -> np.ndarray:
     """Forward pass de la red."""
     W1, b1 = weights["W1"], weights["b1"]
     W2, b2 = weights["W2"], weights["b2"]
-
+    
     Z1 = X @ W1 + b1
     A1 = relu(Z1)
     Z2 = A1 @ W2 + b2
-    A2 = softmax(Z2)
+    
+    return softmax(Z2)
 
-    cache = (X, Z1, A1)
-    return A2, cache
-
-# ======================
-# Loss
-# ======================
-def compute_loss(A2: np.ndarray, y: np.ndarray) -> float:
-    """Calcula la loss (cross-entropy)."""
-    m = y.shape[0]
-    log_likelihood = -np.log(A2[np.arange(m), y] + 1e-9)
-    return np.sum(log_likelihood) / m
-
-# ======================
-# Backward
-# ======================
-def backward(A2: np.ndarray, y: np.ndarray, cache: Tuple, weights: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """Backward pass - calcula gradientes."""
-    X, Z1, A1 = cache
-    W2 = weights["W2"]
-    m = y.shape[0]
-    Y = one_hot(y)
-
-    # Capa de salida
-    dZ2 = A2 - Y
-    dW2 = A1.T @ dZ2 / m
+def backward(X: np.ndarray, y: np.ndarray, 
+             weights: Dict[str, np.ndarray], 
+             output: np.ndarray) -> Dict[str, np.ndarray]:
+    """Backward pass para calcular gradientes."""
+    m = X.shape[0]
+    
+    # Gradiente de la capa de salida
+    dZ2 = output
+    dZ2[np.arange(m), y] -= 1
+    dZ2 = dZ2 / m
+    
+    # Gradientes para W2 y b2
+    A1 = relu(X @ weights["W1"] + weights["b1"])
+    dW2 = A1.T @ dZ2
     db2 = np.sum(dZ2, axis=0)
-
-    # Capa oculta
-    dA1 = dZ2 @ W2.T
-    dZ1 = dA1 * relu_derivative(Z1)
-    dW1 = X.T @ dZ1 / m
+    
+    # Gradiente para capa oculta
+    dA1 = dZ2 @ weights["W2"].T
+    dZ1 = dA1 * (A1 > 0)  # Derivada de ReLU
+    
+    # Gradientes para W1 y b1
+    dW1 = X.T @ dZ1
     db1 = np.sum(dZ1, axis=0)
-
+    
     return {
         "W1": dW1,
         "b1": db1,
@@ -73,18 +63,18 @@ def backward(A2: np.ndarray, y: np.ndarray, cache: Tuple, weights: Dict[str, np.
         "b2": db2
     }
 
-# Función principal para entrenar una época
-def train_epoch(X_chunk: np.ndarray, 
-                y_chunk: np.ndarray, 
+def train_epoch(X: np.ndarray, y: np.ndarray, 
                 weights: Dict[str, np.ndarray]) -> Tuple[Dict[str, np.ndarray], float]:
-    """Entrena una época con el chunk local."""
-    # Forward
-    A2, cache = forward(X_chunk, weights)
+    """Entrena una época y retorna gradientes y loss."""
+    # Forward pass
+    output = forward(X, weights)
     
-    # Calcular loss
-    loss = compute_loss(A2, y_chunk)
+    # Calcular loss (cross-entropy)
+    m = X.shape[0]
+    correct_logprobs = -np.log(output[np.arange(m), y] + 1e-9)
+    loss = np.sum(correct_logprobs) / m
     
-    # Backward
-    grads = backward(A2, y_chunk, cache, weights)
+    # Backward pass
+    grads = backward(X, y, weights, output)
     
     return grads, loss
