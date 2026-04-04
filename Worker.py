@@ -183,7 +183,7 @@ def cnn_compute_gradients(X_np, y_np, weights_dict, model, device,
 
         out  = model(X_batch)
         # Escalar por fracción del batch para gradiente equivalente al total
-        loss = F.cross_entropy(out, y_batch) * (end - start) / n
+        loss = F.cross_entropy(out, y_batch)
         loss.backward()
         total_loss += loss.item()
 
