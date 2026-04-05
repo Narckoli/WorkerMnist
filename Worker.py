@@ -1,19 +1,4 @@
 # Worker.py
-"""
-Correcciones respecto a la versión anterior:
-
-1. CARGA DE PESOS COMPLETA (state_dict)
-   load_state_dict() recibe ahora TODOS los tensores, incluyendo los
-   buffers de BatchNorm (running_mean, running_var, num_batches_tracked).
-   Antes se usaba strict=False y esos buffers se ignoraban, por lo que
-   las estadísticas de normalización nunca eran coherentes entre épocas.
-
-2. SOLO SE ENVÍAN GRADIENTES DE PARÁMETROS ENTRENABLES
-   Los buffers de BatchNorm no tienen gradiente. Se filtran usando
-   named_parameters() al recolectar grads, igual que siempre. El servidor
-   los recibe en el dict "gradients" y actualiza solo esas claves.
-"""
-
 import asyncio
 import json
 import sys
@@ -27,10 +12,6 @@ BATCH_SIZE = 64   # baja a 64 si te quedas sin RAM
 
 _BUFFER_LIMIT = 100 * 1024 * 1024
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Comunicación
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def send_json(writer, data: dict):
     line = json.dumps(data) + '\n'
@@ -96,7 +77,6 @@ def mlp_compute_gradients(X, y, weights):
     dZ2 = A2.copy()
     dZ2[np.arange(m), y] -= 1
     dZ2 /= m
-
     dW2 = A1.T @ dZ2
     db2 = dZ2.sum(axis=0)
     dA1 = dZ2 @ W2.T
@@ -108,7 +88,7 @@ def mlp_compute_gradients(X, y, weights):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CNN (PyTorch) — arquitectura + gradientes con mini-batches
+# CNN (PyTorch) — gradientes + buffers BatchNorm
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_cnn():
@@ -133,11 +113,11 @@ def _build_cnn():
             self.drop  = nn.Dropout(0.5)
 
         def forward(self, x):
-            x = self.pool(F.relu(self.bn1(self.conv1(x))))
-            x = self.pool(F.relu(self.bn2(self.conv2(x))))
-            x = self.pool(F.relu(self.bn3(self.conv3(x))))
+            x = self.pool(torch.relu(self.bn1(self.conv1(x))))
+            x = self.pool(torch.relu(self.bn2(self.conv2(x))))
+            x = self.pool(torch.relu(self.bn3(self.conv3(x))))
             x = x.view(-1, 128 * 4 * 4)
-            x = F.relu(self.fc1(x))
+            x = torch.relu(self.fc1(x))
             x = self.drop(x)
             return self.fc2(x)
 
@@ -147,58 +127,62 @@ def _build_cnn():
 def cnn_compute_gradients(X_np, y_np, weights_dict, model, device,
                           batch_size=BATCH_SIZE):
     """
-    1. Carga el state_dict COMPLETO (incluye buffers BatchNorm).
-    2. Acumula gradientes sobre mini-batches sin agotar RAM.
-    3. Solo retorna gradientes de named_parameters (no buffers).
+    1. Carga state_dict completo (respetando dtypes).
+    2. Acumula gradientes sobre mini-batches.
+    3. Retorna:
+         - gradients: solo parámetros entrenables (para el servidor)
+         - bn_buffers: running_mean, running_var, num_batches_tracked
+                       (para que el servidor actualice sus propios buffers)
+         - loss
     """
     import torch
     import torch.nn.functional as F
 
-    # ── Cargar state_dict completo ────────────────────────────────────────────
-    state_dict = {}
+    # Cargar state_dict completo
+    current_sd = model.state_dict()
+    new_sd = {}
     for k, v in weights_dict.items():
         arr = np.array(v)
-        # num_batches_tracked es entero; el resto son float
-        if 'num_batches_tracked' in k:
-            state_dict[k] = torch.tensor(arr, dtype=torch.long).to(device)
-        else:
-            state_dict[k] = torch.tensor(arr, dtype=torch.float32).to(device)
-
-    model.load_state_dict(state_dict, strict=True)
+        original_dtype = current_sd[k].dtype
+        new_sd[k] = torch.tensor(arr, dtype=original_dtype).to(device)
+    model.load_state_dict(new_sd, strict=True)
     model.train()
     model.zero_grad()
 
     n          = len(X_np)
     total_loss = 0.0
-    n_batches = 0
-    
+
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        
-        X_batch = torch.tensor(X_np[start:end].reshape(-1, 3, 32, 32), dtype=torch.float32).to(device)
-        y_batch = torch.tensor(y_np[start:end], dtype=torch.long).to(device)
-        
-        out = model(X_batch)
-        loss = F.cross_entropy(out, y_batch)  # ← Loss correcto (~2.30)
-        
-        # Backward
+        X_b = torch.tensor(
+            X_np[start:end].reshape(-1, 3, 32, 32),
+            dtype=torch.float32).to(device)
+        y_b = torch.tensor(y_np[start:end], dtype=torch.long).to(device)
+
+        out  = model(X_b)
+        loss = F.cross_entropy(out, y_b) * (end - start) / n
         loss.backward()
-        
-        # Acumular loss PROMEDIADO (no suma)
-        total_loss += loss.item()  # ← Acumular sin multiplicar
-        n_batches += 1
-    
-    # Calcular loss promedio
-    avg_loss = total_loss / n_batches  # ← ¡DIVIDIR!
-    
-    # Recolectar gradientes
+        total_loss += loss.item()
+
+    # Gradientes de parámetros entrenables
     grads = {
         name: param.grad.detach().cpu().numpy()
         for name, param in model.named_parameters()
         if param.grad is not None
     }
-    
-    return grads, avg_loss  # ← Enviar loss PROMEDIADO
+
+    # Buffers de BatchNorm actualizados por el forward pass
+    param_keys = {name for name, _ in model.named_parameters()}
+    bn_buffers = {}
+    for k, v in model.state_dict().items():
+        if k not in param_keys:   # es un buffer, no un parámetro
+            val = v.cpu().numpy()
+            bn_buffers[k] = val.tolist() if isinstance(val, np.ndarray) else int(val)
+
+    n_batches = (n + batch_size - 1) // batch_size
+    print(f"   {n_batches} mini-batches procesados (n={n})")
+
+    return grads, bn_buffers, float(total_loss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,21 +259,29 @@ class Worker:
                 epoch        = msg.get("epoch", "?")
                 weights_data = msg["weights"]
 
-                print(f"[Worker {self.worker_id}] Época {epoch} — calculando gradientes...")
+                print(f"[Worker {self.worker_id}] Época {epoch} "
+                      "— calculando gradientes...")
 
                 if self.model_type == 'cnn':
-                    grads, loss = cnn_compute_gradients(
+                    grads, bn_buffers, loss = cnn_compute_gradients(
                         self.X_chunk, self.y_chunk,
                         weights_data, self._cnn_model, self._cnn_device)
+
+                    # Incluir buffers BatchNorm en el mensaje de gradientes
+                    grads_serial = {
+                        k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                        for k, v in grads.items()
+                    }
+                    grads_serial['__bn_buffers__'] = bn_buffers
+
                 else:
                     weights = {k: np.array(v) for k, v in weights_data.items()}
                     grads, loss = mlp_compute_gradients(
                         self.X_chunk, self.y_chunk, weights)
-
-                grads_serial = {
-                    k: (v.tolist() if isinstance(v, np.ndarray) else v)
-                    for k, v in grads.items()
-                }
+                    grads_serial = {
+                        k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                        for k, v in grads.items()
+                    }
 
                 await send_json(self.writer, {
                     "type":      "gradients",
