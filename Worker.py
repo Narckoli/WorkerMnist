@@ -170,34 +170,35 @@ def cnn_compute_gradients(X_np, y_np, weights_dict, model, device,
 
     n          = len(X_np)
     total_loss = 0.0
-
+    n_batches = 0
+    
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-
-        X_batch = torch.tensor(
-            X_np[start:end].reshape(-1, 3, 32, 32),
-            dtype=torch.float32).to(device)
-        y_batch = torch.tensor(
-            y_np[start:end],
-            dtype=torch.long).to(device)
-
-        out  = model(X_batch)
-        # Escalar por fracción del batch para gradiente equivalente al total
-        loss = F.cross_entropy(out, y_batch)
+        
+        X_batch = torch.tensor(X_np[start:end].reshape(-1, 3, 32, 32), dtype=torch.float32).to(device)
+        y_batch = torch.tensor(y_np[start:end], dtype=torch.long).to(device)
+        
+        out = model(X_batch)
+        loss = F.cross_entropy(out, y_batch)  # ← Loss correcto (~2.30)
+        
+        # Backward
         loss.backward()
-        total_loss += loss.item()
-
-    # Recolectar solo gradientes de parámetros entrenables
+        
+        # Acumular loss PROMEDIADO (no suma)
+        total_loss += loss.item()  # ← Acumular sin multiplicar
+        n_batches += 1
+    
+    # Calcular loss promedio
+    avg_loss = total_loss / n_batches  # ← ¡DIVIDIR!
+    
+    # Recolectar gradientes
     grads = {
         name: param.grad.detach().cpu().numpy()
         for name, param in model.named_parameters()
         if param.grad is not None
     }
-
-    n_batches = (n + batch_size - 1) // batch_size
-    print(f"   {n_batches} mini-batches (batch={batch_size}, n={n})")
-
-    return grads, float(total_loss)
+    
+    return grads, avg_loss  # ← Enviar loss PROMEDIADO
 
 
 # ══════════════════════════════════════════════════════════════════════════════
