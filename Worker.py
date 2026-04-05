@@ -22,7 +22,7 @@ import numpy as np
 # ── Configuración ─────────────────────────────────────────────────────────────
 HOST = '192.168.0.3'
 PORT = 5000
-BATCH_SIZE = 128   # baja a 64 si te quedas sin RAM
+BATCH_SIZE = 64   # baja a 64 si te quedas sin RAM
 # ─────────────────────────────────────────────────────────────────────────────
 
 _BUFFER_LIMIT = 100 * 1024 * 1024
