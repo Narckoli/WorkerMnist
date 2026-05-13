@@ -2,6 +2,7 @@
 """
 Worker de entrenamiento distribuido asincrono para EfficientNetLite-0.
 Compatible con servidor v4 (recibe max_epochs del servidor).
+VERSION CORREGIDA - Sincronizacion robusta por epocas.
 """
 
 import asyncio
@@ -37,8 +38,8 @@ logger = logging.getLogger("Worker")
 CONFIG_FILE = Path.home() / ".dist_train_config.json"
 ENV_VAR_HOST = "DIST_SERVER_HOST"
 ENV_VAR_PORT = "DIST_SERVER_PORT"
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 8765
+DEFAULT_HOST = "192.168.61.239"
+DEFAULT_PORT = 5000
 
 
 def load_config_file():
@@ -278,8 +279,8 @@ class ChunkedDataset:
         self.chunk_size = chunk_size
         self.full_dataset = self._load_dataset()
         self.total_samples = len(self.full_dataset)
-        self.total_batches = (self.total_samples + batch_size - 1) // batch_size
-        self.total_chunks = (self.total_batches + chunk_size - 1) // chunk_size
+        self.total_batches = (self.total_samples + batch_size - 1) // self.batch_size
+        self.total_chunks = (self.total_batches + chunk_size - 1) // self.chunk_size
         logger.info(f"Dataset: {dataset_name} | {self.total_samples} muestras | {self.total_chunks} chunks")
     
     def _load_dataset(self):
@@ -412,38 +413,35 @@ class AsyncDistWorker:
                 chunk_size=chunk_size
             )
             
-            # 4. Esperar modelo inicial
+            # 4. Esperar modelo inicial / primera época
             logger.info("Esperando modelo inicial...")
             msg = await recv_msg(reader)
             
             if msg['type'] == 'epoch_start':
-                epoch = msg['epoch']
+                current_epoch = msg['epoch']
                 state_dict = msg['state_dict']
                 chunk_assignment = msg['chunk_assignment']
                 if 'max_epochs' in msg:
                     self.max_epochs = msg['max_epochs']
                 
                 self.create_model(state_dict)
-                
+            else:
+                raise ValueError(f"Mensaje inesperado: {msg['type']}")
+            
+            # ← CORREGIDO: Bucle principal de épocas controlado EXTERNAMENTE por el servidor
+            while current_epoch < self.max_epochs:
                 my_chunks = chunk_assignment.get(self.worker_id, [])
-                logger.info(f"Epoca {epoch}/{self.max_epochs} | Chunks: {my_chunks[:10]}...")
+                logger.info(f"Worker {self.worker_id} | Epoca {current_epoch}/{self.max_epochs} | Chunks: {len(my_chunks)}")
                 
                 train_loader = self.chunked_dataset.create_dataloader(
                     my_chunks,
                     num_workers=self.optimal_config['num_workers']
                 )
-            else:
-                raise ValueError(f"Mensaje inesperado: {msg['type']}")
-            
-            # 5. Bucle de entrenamiento
-            global_step = 0
-            current_epoch = epoch
-            
-            while current_epoch < self.max_epochs:
+                
+                # Entrenar TODOS los batches de esta época
                 epoch_loss = 0.0
                 num_batches = 0
-                
-                logger.info(f"Worker {self.worker_id} | Epoca {current_epoch}/{self.max_epochs}")
+                global_step = 0
                 
                 for batch_idx, (data, target) in enumerate(train_loader):
                     gradients, loss = self.compute_gradients(data, target)
@@ -451,6 +449,7 @@ class AsyncDistWorker:
                     num_batches += 1
                     global_step += 1
                     
+                    # Enviar gradientes al servidor
                     await send_msg(writer, {
                         'type': 'gradients',
                         'gradients': gradients,
@@ -460,6 +459,7 @@ class AsyncDistWorker:
                         'epoch': current_epoch
                     })
                     
+                    # Esperar respuesta del servidor (modelo actualizado o nueva época)
                     try:
                         msg = await asyncio.wait_for(recv_msg(reader), timeout=60.0)
                         
@@ -467,24 +467,22 @@ class AsyncDistWorker:
                             self.update_model(msg['state_dict'])
                             
                         elif msg['type'] == 'epoch_start':
+                            # ← CORREGIDO: El servidor nos dice que hay nueva época
+                            # PERO solo procesarla si es DIFERENTE a la actual
                             new_epoch = msg['epoch']
-                            new_state_dict = msg['state_dict']
-                            new_assignment = msg['chunk_assignment']
-                            if 'max_epochs' in msg:
-                                self.max_epochs = msg['max_epochs']
-                            
-                            self.update_model(new_state_dict)
-                            current_epoch = new_epoch
-                            
-                            my_chunks = new_assignment.get(self.worker_id, [])
-                            logger.info(f"NUEVA EPOCA {current_epoch}/{self.max_epochs}")
-                            
-                            train_loader = self.chunked_dataset.create_dataloader(
-                                my_chunks,
-                                num_workers=self.optimal_config['num_workers']
-                            )
-                            break
-                            
+                            if new_epoch != current_epoch:
+                                logger.info(f"Servidor indica nueva epoca {new_epoch} (actual: {current_epoch})")
+                                self.update_model(msg['state_dict'])
+                                current_epoch = new_epoch
+                                chunk_assignment = msg['chunk_assignment']
+                                if 'max_epochs' in msg:
+                                    self.max_epochs = msg['max_epochs']
+                                # ← IMPORTANTE: Romper el for de batches para iniciar nueva época
+                                break
+                            else:
+                                # Misma época, ignorar (posible re-sincronización)
+                                self.update_model(msg['state_dict'])
+                                
                         elif msg['type'] == 'training_done':
                             logger.info("Servidor indica fin del entrenamiento!")
                             return
@@ -496,19 +494,44 @@ class AsyncDistWorker:
                         logger.info(f"   Worker {self.worker_id} | Epoch {current_epoch}/{self.max_epochs} | "
                                     f"Batch {batch_idx}/{len(train_loader)} | Loss: {loss:.4f}")
                 
-                # Epoca completada
-                avg_loss = epoch_loss / max(num_batches, 1)
-                logger.info(f"Worker {self.worker_id} | Epoca {current_epoch}/{self.max_epochs} COMPLETADA | Loss: {avg_loss:.4f}")
+                else:
+                    # ← CORREGIDO: Solo si el for terminó NORMALMENTE (no por break)
+                    # Calcular loss promedio y reportar al servidor
+                    avg_loss = epoch_loss / max(num_batches, 1)
+                    logger.info(f"Worker {self.worker_id} | Epoca {current_epoch}/{self.max_epochs} COMPLETADA | Loss: {avg_loss:.4f}")
+                    
+                    await send_msg(writer, {
+                        'type': 'epoch_complete',
+                        'epoch': current_epoch,
+                        'worker_id': self.worker_id,
+                        'avg_loss': avg_loss
+                    })
+                    
+                    # ← CRÍTICO: Esperar confirmación del servidor para avanzar
+                    # El servidor enviará epoch_start con la siguiente época O training_done
+                    logger.info(f"Worker {self.worker_id} esperando siguiente epoca...")
+                    msg = await recv_msg(reader)
+                    
+                    if msg['type'] == 'epoch_start':
+                        new_epoch = msg['epoch']
+                        logger.info(f"Recibida epoca {new_epoch}")
+                        self.update_model(msg['state_dict'])
+                        current_epoch = new_epoch
+                        chunk_assignment = msg['chunk_assignment']
+                        if 'max_epochs' in msg:
+                            self.max_epochs = msg['max_epochs']
+                            
+                    elif msg['type'] == 'training_done':
+                        logger.info("Entrenamiento finalizado por el servidor")
+                        return
+                    else:
+                        logger.warning(f"Mensaje inesperado esperando siguiente epoca: {msg['type']}")
+                        return
                 
-                await send_msg(writer, {
-                    'type': 'epoch_complete',
-                    'epoch': current_epoch,
-                    'worker_id': self.worker_id,
-                    'avg_loss': avg_loss
-                })
-                
-                current_epoch += 1
+                # Si salimos por break (nueva época durante batches), el while continúa
+                # con current_epoch ya actualizado
             
+            # Fin del entrenamiento
             await send_msg(writer, {'type': 'done'})
             logger.info(f"Worker {self.worker_id} finalizo {self.max_epochs} epocas")
             
@@ -517,8 +540,12 @@ class AsyncDistWorker:
             import traceback
             traceback.print_exc()
         finally:
-            writer.close()
-            await writer.wait_closed()
+            # ← CORREGIDO: Cierre seguro
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except (asyncio.TimeoutError, OSError, ConnectionResetError):
+                pass
 
 
 # ==================== MAIN ====================
