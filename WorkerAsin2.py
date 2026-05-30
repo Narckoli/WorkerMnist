@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
 """
-Worker SINCRONO por epoca - CORREGIDO.
-- Normaliza gradientes antes de enviar
-- No corrompe BatchNorm
-- num_workers=0 para estabilidad
+Worker 100% ASINCRONO.
+- Entrena continuamente sin esperar a nadie
+- Envía gradientes cada N batches (no al final de epoca)
+- Recibe modelo actualizado inmediatamente
+- NUNCA se bloquea
+- Maneja version tracking para staleness
 """
 
 import asyncio
@@ -17,6 +18,7 @@ import psutil
 import os
 import json
 import socket
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -32,7 +34,7 @@ logging.basicConfig(
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger("Worker")
+logger = logging.getLogger("WorkerAsync")
 
 
 # ==================== CONFIGURACION ====================
@@ -76,7 +78,7 @@ def get_env_config():
     return None, None
 
 
-def discover_server_on_network(port=8765, timeout=2.0):
+def discover_server_on_network(port=5000, timeout=2.0):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -230,18 +232,34 @@ async def recv_msg(reader):
 
 
 # ==================== DATASET ====================
-class ChunkedDataset:
-    def __init__(self, dataset_name='cifar10', data_dir='./data', batch_size=32, chunk_size=10):
+class AsyncDataset:
+    """
+    Dataset para entrenamiento asincrono.
+    - Divide el dataset en chunks
+    - Cada worker recibe asignacion de chunks
+    - Shuffling por epoca para variedad
+    """
+    def __init__(self, dataset_name='cifar10', data_dir='./data', batch_size=32, 
+                 chunk_size=10, worker_id=0, total_workers=1):
         self.dataset_name = dataset_name
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.chunk_size = chunk_size
+        self.worker_id = worker_id
+        self.total_workers = total_workers
+        
         logger.info("Cargando dataset...")
         self.full_dataset = self._load_dataset()
         self.total_samples = len(self.full_dataset)
-        self.total_batches = (self.total_samples + batch_size - 1) // self.batch_size
+        self.total_batches = (self.total_samples + batch_size - 1) // batch_size
         self.total_chunks = (self.total_batches + self.chunk_size - 1) // self.chunk_size
-        logger.info(f"Dataset listo: {self.total_samples} muestras | {self.total_batches} batches | {self.total_chunks} chunks")
+        
+        # Asignar chunks a este worker
+        self._assign_chunks()
+        
+        logger.info(f"Dataset listo: {self.total_samples} muestras | "
+                   f"{self.total_batches} batches | {self.total_chunks} chunks | "
+                   f"Worker {worker_id}: {len(self.assigned_chunks)} chunks")
     
     def _load_dataset(self):
         if self.dataset_name == 'cifar10':
@@ -259,6 +277,19 @@ class ChunkedDataset:
             from torch.utils.data import TensorDataset
             return TensorDataset(X, y)
     
+    def _assign_chunks(self):
+        """Asigna chunks a este worker de forma round-robin."""
+        self.assigned_chunks = []
+        for chunk_idx in range(self.total_chunks):
+            if chunk_idx % self.total_workers == self.worker_id:
+                self.assigned_chunks.append(chunk_idx)
+    
+    def shuffle_chunks(self, seed=None):
+        """Reordena los chunks para la siguiente epoca."""
+        if seed is not None:
+            random.seed(seed)
+        random.shuffle(self.assigned_chunks)
+    
     def get_sample_indices_for_chunks(self, chunk_indices):
         indices = []
         for chunk_idx in sorted(chunk_indices):
@@ -269,19 +300,43 @@ class ChunkedDataset:
             indices.extend(range(start_sample, end_sample))
         return indices
     
-    def create_dataloader(self, chunk_indices, num_workers=0):
+    def create_dataloader(self, chunk_indices=None, num_workers=0):
+        if chunk_indices is None:
+            chunk_indices = self.assigned_chunks
         sample_indices = self.get_sample_indices_for_chunks(chunk_indices)
         subset = Subset(self.full_dataset, sample_indices)
-        return DataLoader(subset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, drop_last=False)
+        return DataLoader(subset, batch_size=self.batch_size, shuffle=True, 
+                         num_workers=num_workers, pin_memory=False, drop_last=False)
+    
+    def get_all_batches_iterator(self):
+        """Generador infinito de batches para entrenamiento continuo."""
+        epoch = 0
+        while True:
+            self.shuffle_chunks(seed=42 + epoch)
+            loader = self.create_dataloader()
+            for batch in loader:
+                yield batch, epoch
+            epoch += 1
 
 
-# ==================== WORKER CORREGIDO ====================
-class SyncEpochWorker:
-    def __init__(self, server_host='localhost', server_port=8765, num_classes=10, data_dir='./data'):
+# ==================== WORKER ASINCRONO ====================
+class AsyncWorker:
+    """
+    Worker completamente asincrono:
+    - Entrena continuamente sin esperar
+    - Acumula gradientes localmente
+    - Envía al servidor cada N batches (gradient_frequency)
+    - Recibe modelo actualizado inmediatamente
+    - NUNCA se bloquea esperando a otros workers
+    """
+    
+    def __init__(self, server_host='localhost', server_port=5000, num_classes=10, 
+                 data_dir='./data', gradient_frequency=5):
         self.server_host = server_host
         self.server_port = server_port
         self.num_classes = num_classes
         self.data_dir = data_dir
+        self.gradient_frequency = gradient_frequency  # Enviar gradientes cada N batches
         
         self.worker_id = None
         self.total_workers = None
@@ -290,16 +345,29 @@ class SyncEpochWorker:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.hardware_info = detect_hardware()
-        self.chunked_dataset = None
-        self.max_epochs = None
+        self.dataset = None
+        self.max_updates = None
         
-        # Acumuladores de gradientes por epoca
-        self.epoch_gradients = {}
+        # Version tracking
+        self.local_model_version = 0
+        self.server_model_version = 0
+        
+        # Acumuladores de gradientes
+        self.accumulated_gradients = {}
+        self.accumulated_loss = 0.0
+        self.accumulated_count = 0
+        
+        # Estadisticas
+        self.total_batches_processed = 0
+        self.total_gradients_sent = 0
+        self.staleness_history = []
         
         logger.info("=" * 60)
-        logger.info("WORKER SYNC POR EPOCA - CORREGIDO")
+        logger.info("WORKER 100% ASINCRONO")
         logger.info(f"   Hardware: {self.hardware_info['cpu']}")
         logger.info(f"   Tier: {self.hardware_info['tier']}")
+        logger.info(f"   Device: {self.device}")
+        logger.info(f"   Gradient frequency: cada {gradient_frequency} batches")
         logger.info("=" * 60)
 
     def create_model(self, state_dict=None):
@@ -307,7 +375,6 @@ class SyncEpochWorker:
         self.model = EfficientNetLite0(num_classes=self.num_classes).to(self.device)
         
         if state_dict is not None:
-            # CORRECCION: Cargar solo parametros entrenables, NO BatchNorm stats
             with torch.no_grad():
                 for name, param in self.model.named_parameters():
                     if name in state_dict:
@@ -317,13 +384,15 @@ class SyncEpochWorker:
         self.criterion = nn.CrossEntropyLoss()
         logger.info(f"Modelo listo en {self.device}")
 
-    def zero_epoch_gradients(self):
-        """Limpiar acumuladores al inicio de cada epoca."""
-        self.epoch_gradients = {}
+    def zero_accumulated_gradients(self):
+        """Limpia acumuladores de gradientes."""
+        self.accumulated_gradients = {}
+        self.accumulated_loss = 0.0
+        self.accumulated_count = 0
 
-    def accumulate_gradients(self, data, target):
+    def accumulate_batch_gradient(self, data, target):
         """
-        Calcula gradientes para un batch y los ACUMULA.
+        Calcula gradientes para un batch y los acumula localmente.
         NO aplica optimizer.step() - eso lo hace el servidor.
         """
         self.model.train()
@@ -335,29 +404,109 @@ class SyncEpochWorker:
         loss = self.criterion(output, target)
         loss.backward()
         
-        # ACUMULAR en buffer de epoca
+        # Acumular gradientes
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                if name not in self.epoch_gradients:
-                    self.epoch_gradients[name] = param.grad.cpu().clone()
+                grad_cpu = param.grad.cpu().clone()
+                if name not in self.accumulated_gradients:
+                    self.accumulated_gradients[name] = grad_cpu
                 else:
-                    self.epoch_gradients[name] += param.grad.cpu().clone()
+                    self.accumulated_gradients[name] += grad_cpu
+        
+        self.accumulated_loss += loss.item()
+        self.accumulated_count += 1
+        self.total_batches_processed += 1
         
         return loss.item()
 
-    def get_normalized_gradients(self, num_batches):
+    def get_averaged_gradients(self):
         """
-        CORRECCION CRITICA: Divide los gradientes acumulados por el numero de batches.
-        Esto hace que el gradiente sea el PROMEDIO por batch, equivalente a SGD.
+        Promedia los gradientes acumulados.
         """
-        if num_batches == 0:
+        if self.accumulated_count == 0:
             return {}
         
-        normalized = {}
-        for name, grad in self.epoch_gradients.items():
-            normalized[name] = grad / num_batches
+        averaged = {}
+        for name, grad in self.accumulated_gradients.items():
+            averaged[name] = grad / self.accumulated_count
         
-        return normalized
+        return averaged
+
+    async def send_gradient_and_wait_model(self, writer, reader):
+        """
+        Envia gradientes acumulados al servidor y espera el modelo actualizado.
+        """
+        if self.accumulated_count == 0:
+            return True
+        
+        gradients = self.get_averaged_gradients()
+        avg_loss = self.accumulated_loss / self.accumulated_count
+        
+        logger.info(f"Enviando gradiente (batches: {self.accumulated_count}, "
+                   f"loss: {avg_loss:.4f}, version local: {self.local_model_version})")
+        
+        await send_msg(writer, {
+            'type': 'gradient',
+            'gradients': gradients,
+            'model_version': self.local_model_version,
+            'loss': avg_loss,
+            'worker_id': self.worker_id,
+            'batch_count': self.accumulated_count
+        })
+        
+        # Esperar confirmacion del servidor
+        try:
+            response = await asyncio.wait_for(recv_msg(reader), timeout=10.0)
+            
+            if response['type'] == 'gradient_received':
+                logger.info(f"Gradiente aceptado | Queue: {response.get('queue_size', '?')} | "
+                           f"Server version: {response.get('model_version', '?')}")
+                
+                # Ahora esperar el modelo actualizado
+                model_msg = await asyncio.wait_for(recv_msg(reader), timeout=30.0)
+                
+                if model_msg['type'] == 'model_update':
+                    new_version = model_msg['model_version']
+                    staleness = new_version - self.local_model_version
+                    self.staleness_history.append(staleness)
+                    
+                    logger.info(f"Modelo actualizado: v{self.local_model_version} -> v{new_version} "
+                               f"(staleness: {staleness})")
+                    
+                    # Cargar nuevo modelo
+                    with torch.no_grad():
+                        for name, param in self.model.named_parameters():
+                            if name in model_msg['state_dict']:
+                                param.copy_(model_msg['state_dict'][name])
+                    
+                    self.local_model_version = new_version
+                    self.server_model_version = new_version
+                    self.total_gradients_sent += 1
+                    
+                    # Limpiar acumuladores
+                    self.zero_accumulated_gradients()
+                    
+                    # Verificar si terminamos
+                    if model_msg.get('total_updates', 0) >= model_msg.get('max_updates', float('inf')):
+                        logger.info("Max updates alcanzado por el servidor!")
+                        return False
+                    
+                    return True
+                    
+                elif model_msg['type'] == 'training_done':
+                    logger.info("Entrenamiento finalizado por el servidor!")
+                    return False
+                    
+            elif response['type'] == 'gradient_rejected':
+                logger.warning(f"Gradiente rechazado: {response.get('reason', 'unknown')}")
+                self.zero_accumulated_gradients()
+                return True
+                
+        except asyncio.TimeoutError:
+            logger.warning("Timeout esperando respuesta del servidor")
+            return True
+        
+        return True
 
     async def run(self):
         logger.info(f"Conectando a {self.server_host}:{self.server_port}...")
@@ -383,118 +532,92 @@ class SyncEpochWorker:
                 self.total_workers = response['total_workers']
                 server_batch_size = response['batch_size']
                 dataset_name = response['dataset']
-                self.max_epochs = response.get('max_epochs', 10)
+                self.max_updates = response.get('max_updates', 1000)
+                self.server_model_version = response.get('model_version', 0)
                 
                 logger.info(f"Asignado: Worker {self.worker_id}/{self.total_workers}")
                 logger.info(f"   Batch size: {server_batch_size}")
-                logger.info(f"   Epocas: {self.max_epochs}")
+                logger.info(f"   Max updates: {self.max_updates}")
             
             # 3. Cargar dataset
-            self.chunked_dataset = ChunkedDataset(
+            self.dataset = AsyncDataset(
                 dataset_name=dataset_name,
                 data_dir=self.data_dir,
                 batch_size=server_batch_size,
-                chunk_size=10
+                chunk_size=10,
+                worker_id=self.worker_id,
+                total_workers=self.total_workers
             )
             
             # 4. Esperar modelo inicial
             logger.info("Esperando modelo inicial...")
             msg = await recv_msg(reader)
             
-            if msg['type'] != 'epoch_start':
+            if msg['type'] == 'model_update':
+                self.create_model(msg['state_dict'])
+                self.local_model_version = msg['model_version']
+                logger.info(f"Modelo inicial recibido (version {self.local_model_version})")
+            else:
                 raise ValueError(f"Mensaje inesperado: {msg['type']}")
             
-            current_epoch = msg['epoch']
-            # CORRECCION: state_dict del servidor solo tiene pesos entrenables
-            self.create_model(msg['state_dict'])
-            chunk_assignment = msg['chunk_assignment']
-            if 'max_epochs' in msg:
-                self.max_epochs = msg['max_epochs']
+            # 5. Bucle de entrenamiento asincrono INFINITO
+            logger.info("=" * 60)
+            logger.info("INICIANDO ENTRENAMIENTO ASINCRONO CONTINUO")
+            logger.info("=" * 60)
             
-            # 5. Bucle de epocas
-            while current_epoch < self.max_epochs:
-                my_chunks = chunk_assignment.get(self.worker_id, [])
-                
-                # CORRECCION: num_workers=0 para evitar cuelgues en Windows
-                train_loader = self.chunked_dataset.create_dataloader(
-                    my_chunks,
-                    num_workers=0
-                )
-                
-                total_batches = len(train_loader)
-                logger.info("=" * 60)
-                logger.info(f"EPOCA {current_epoch}/{self.max_epochs} INICIANDO")
-                logger.info(f"   Batches: {total_batches}")
-                logger.info("=" * 60)
-                
-                # Limpiar acumuladores
-                self.zero_epoch_gradients()
-                
-                # Entrenar TODA la epoca localmente
-                epoch_loss = 0.0
-                num_batches = 0
-                
-                for batch_idx, (data, target) in enumerate(train_loader):
-                    loss = self.accumulate_gradients(data, target)
-                    epoch_loss += loss
-                    num_batches += 1
-                    
-                    # Imprimir cada 20 batches
-                    if batch_idx % 20 == 0 or batch_idx == total_batches - 1:
-                        avg_so_far = epoch_loss / max(num_batches, 1)
-                        logger.info(f"   Batch {batch_idx}/{total_batches} | "
-                                   f"Loss: {loss:.4f} | Media: {avg_so_far:.4f} | "
-                                   f"Progreso: {100*num_batches/total_batches:.1f}%")
-                
-                # Calcular loss promedio
-                avg_epoch_loss = epoch_loss / max(num_batches, 1)
-                
-                logger.info("=" * 60)
-                logger.info(f"EPOCA {current_epoch} COMPLETADA")
-                logger.info(f"   Loss media: {avg_epoch_loss:.4f}")
-                logger.info(f"   Batches: {num_batches}")
-                logger.info("=" * 60)
-                
-                # CORRECCION CRITICA: Normalizar gradientes antes de enviar
-                normalized_gradients = self.get_normalized_gradients(num_batches)
-                
-                # 6. Enviar gradientes normalizados
-                logger.info("Enviando gradientes normalizados al servidor...")
-                await send_msg(writer, {
-                    'type': 'epoch_complete',
-                    'epoch': current_epoch,
-                    'worker_id': self.worker_id,
-                    'avg_loss': avg_epoch_loss,
-                    'gradients': normalized_gradients,  # ← PROMEDIO, no suma
-                    'num_batches': num_batches
-                })
-                
-                # 7. Esperar modelo actualizado
-                logger.info("Esperando modelo actualizado...")
-                msg = await recv_msg(reader)
-                
-                if msg['type'] == 'epoch_start':
-                    new_epoch = msg['epoch']
-                    logger.info(f"Recibida epoca {new_epoch}")
-                    # CORRECCION: Cargar solo pesos entrenables, no BatchNorm stats
-                    with torch.no_grad():
-                        for name, param in self.model.named_parameters():
-                            if name in msg['state_dict']:
-                                param.copy_(msg['state_dict'][name])
-                    current_epoch = new_epoch
-                    chunk_assignment = msg['chunk_assignment']
-                    if 'max_epochs' in msg:
-                        self.max_epochs = msg['max_epochs']
+            batch_iterator = self.dataset.get_all_batches_iterator()
+            self.zero_accumulated_gradients()
+            
+            running = True
+            while running:
+                # Entrenar batches y acumular gradientes
+                for _ in range(self.gradient_frequency):
+                    try:
+                        (data, target), epoch = next(batch_iterator)
+                        loss = self.accumulate_batch_gradient(data, target)
                         
-                elif msg['type'] == 'training_done':
-                    logger.info("Entrenamiento finalizado!")
-                    break
-                else:
-                    logger.warning(f"Mensaje inesperado: {msg['type']}")
-                    break
+                        # Log cada 20 batches
+                        if self.total_batches_processed % 20 == 0:
+                            avg_loss = self.accumulated_loss / max(self.accumulated_count, 1)
+                            logger.info(f"Batch {self.total_batches_processed} | "
+                                       f"Loss: {loss:.4f} | Acum loss: {avg_loss:.4f} | "
+                                       f"Version: {self.local_model_version}")
+                        
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        logger.error(f"Error en batch: {e}")
+                        continue
+                
+                # Enviar gradientes acumulados al servidor
+                if self.accumulated_count > 0:
+                    running = await self.send_gradient_and_wait_model(writer, reader)
+                
+                # Verificar si el servidor indico fin
+                # (checkear mensajes pendientes sin bloquear)
+                try:
+                    pending_msg = await asyncio.wait_for(recv_msg(reader), timeout=0.1)
+                    if pending_msg['type'] == 'training_done':
+                        logger.info("Recibido training_done del servidor")
+                        running = False
+                        break
+                    elif pending_msg['type'] == 'heartbeat':
+                        # Responder heartbeat
+                        pass
+                except asyncio.TimeoutError:
+                    pass
             
+            # Finalizar
             await send_msg(writer, {'type': 'done'})
-            logger.info("Worker finalizo correctamente")
+            
+            # Estadisticas finales
+            avg_staleness = sum(self.staleness_history) / len(self.staleness_history) if self.staleness_history else 0
+            logger.info("=" * 60)
+            logger.info("WORKER FINALIZADO")
+            logger.info(f"   Batches procesados: {self.total_batches_processed}")
+            logger.info(f"   Gradientes enviados: {self.total_gradients_sent}")
+            logger.info(f"   Staleness promedio: {avg_staleness:.2f}")
+            logger.info("=" * 60)
             
         except Exception as e:
             logger.error(f"Error en Worker: {e}")
@@ -511,20 +634,28 @@ class SyncEpochWorker:
 # ==================== MAIN ====================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Worker Sync por Epoca - Corregido',
-        epilog="Ejemplo: python worker.py --server-host 192.168.1.10"
+        description='Worker 100% Asincrono',
+        epilog="Ejemplo: python WorkerAsync.py --server-host 192.168.0.11"
     )
     parser.add_argument('--server-host', default=DEFAULT_HOST)
     parser.add_argument('--server-port', type=int, default=DEFAULT_PORT)
     parser.add_argument('--auto-discover', action='store_true')
     parser.add_argument('--num-classes', type=int, default=10)
     parser.add_argument('--data-dir', default='./data')
+    parser.add_argument('--gradient-frequency', type=int, default=5,
+                        help='Enviar gradientes al servidor cada N batches')
     
     args = parser.parse_args()
     
     host, port = resolve_server_config(args.server_host, args.server_port, args.auto_discover)
     
-    worker = SyncEpochWorker(server_host=host, server_port=port, num_classes=args.num_classes, data_dir=args.data_dir)
+    worker = AsyncWorker(
+        server_host=host, 
+        server_port=port, 
+        num_classes=args.num_classes, 
+        data_dir=args.data_dir,
+        gradient_frequency=args.gradient_frequency
+    )
     
     try:
         asyncio.run(worker.run())
