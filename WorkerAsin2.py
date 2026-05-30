@@ -354,7 +354,7 @@ class AsyncWorker:
     """
 
     def __init__(self, server_host='localhost', server_port=5000, num_classes=10,
-                 data_dir='./data', gradient_frequency=5):
+                 data_dir='./data', gradient_frequency=2):
         self.server_host = server_host
         self.server_port = server_port
         self.num_classes = num_classes
