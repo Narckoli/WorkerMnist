@@ -423,7 +423,7 @@ class AsyncWorker:
 
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                grad_cpu = param.grad.detach().cpu().clone()
+                grad_cpu = param.grad.detach().cpu().to(torch.float16)
                 if name not in self.accumulated_gradients:
                     self.accumulated_gradients[name] = grad_cpu
                 else:
@@ -444,11 +444,12 @@ class AsyncWorker:
         }
 
     def apply_model_update(self, state_dict):
-        """Carga los pesos recibidos del servidor en el modelo local."""
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if name in state_dict:
-                    param.copy_(state_dict[name].to(self.device))
+        device_state = {}
+
+        for k, v in state_dict.items():
+            device_state[k] = v.to(self.device)
+
+        self.model.load_state_dict(device_state, strict=True)
 
     async def send_gradient_and_receive_model(self, writer, reader):
         """
@@ -522,7 +523,6 @@ class AsyncWorker:
         elif msg_type == 'heartbeat':
             # Heartbeat inesperado en este punto - ignorar y continuar
             logger.debug(f"Heartbeat recibido durante espera de model_update (version servidor: {response.get('model_version')})")
-            self.zero_accumulated_gradients()
             return True
 
         else:
@@ -653,7 +653,7 @@ if __name__ == '__main__':
     parser.add_argument('--auto-discover', action='store_true')
     parser.add_argument('--num-classes', type=int, default=10)
     parser.add_argument('--data-dir', default='./data')
-    parser.add_argument('--gradient-frequency', type=int, default=5,
+    parser.add_argument('--gradient-frequency', type=int, default=1,
                         help='Enviar gradientes al servidor cada N batches')
 
     args = parser.parse_args()
