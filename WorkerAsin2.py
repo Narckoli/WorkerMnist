@@ -245,9 +245,9 @@ async def recv_msg(reader, timeout=120.0):
     Recibe un mensaje con length-prefix de 4 bytes (big-endian).
     Lee EXACTAMENTE los bytes indicados - sin sobrelecura del buffer.
     """
-    logger.info(f"RX {length/1024/1024:.2f} MB")
     length_data = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
     length = struct.unpack('>I', length_data)[0]
+    logger.info(f"RX {length/1024/1024:.2f} MB")
     if length == 0:
         raise ValueError("Longitud de mensaje es 0")
     if length > 100_000_000:
