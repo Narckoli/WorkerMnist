@@ -280,9 +280,32 @@ class AsyncDataset:
 
         self._assign_chunks()
 
-        logger.info(f"Dataset listo: {self.total_samples} muestras | "
-                   f"{self.total_batches} batches | {self.total_chunks} chunks | "
-                   f"Worker {worker_id}: {len(self.assigned_chunks)} chunks")
+        sample_indices = self.get_sample_indices_for_chunks(
+            self.assigned_chunks
+        )
+
+        logger.info(
+            f"Worker ID: {self.worker_id}"
+        )
+
+        logger.info(
+            f"Total Workers: {self.total_workers}"
+        )
+
+        logger.info(
+            f"Chunks asignados: {len(self.assigned_chunks)}"
+        )
+
+        logger.info(
+            f"Muestras asignadas: {len(sample_indices)}"
+        )
+
+        logger.info(
+            f"Dataset listo: {self.total_samples} muestras | "
+            f"{self.total_batches} batches | "
+            f"{self.total_chunks} chunks | "
+            f"Worker {worker_id}: {len(self.assigned_chunks)} chunks"
+        )
 
     def _load_dataset(self):
         if self.dataset_name == 'cifar10':
@@ -388,25 +411,6 @@ class AsyncWorker:
         logger.info(f"   Tier: {self.hardware_info['tier']}")
         logger.info(f"   Device: {self.device}")
         logger.info(f"   Gradient frequency: cada {gradient_frequency} batches")
-        logger.info(
-            f"Worker ID = {self.worker_id}"
-        )
-
-        logger.info(
-            f"Total Workers = {self.total_workers}"
-        )
-
-        logger.info(
-            f"Chunks asignados = {len(self.assigned_chunks)}"
-        )
-
-        sample_indices = self.get_sample_indices_for_chunks(
-            self.assigned_chunks
-        )
-
-        logger.info(
-            f"Muestras asignadas = {len(sample_indices)}"
-        )
 
     def create_model(self, state_dict=None):
         self.model = EfficientNetLite0(num_classes=self.num_classes).to(self.device)
