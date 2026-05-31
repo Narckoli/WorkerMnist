@@ -384,13 +384,29 @@ class AsyncWorker:
         self.total_gradients_sent = 0
         self.staleness_history = []
 
-        logger.info("=" * 60)
-        logger.info("WORKER 100% ASINCRONO - CORREGIDO")
         logger.info(f"   Hardware: {self.hardware_info['cpu']}")
         logger.info(f"   Tier: {self.hardware_info['tier']}")
         logger.info(f"   Device: {self.device}")
         logger.info(f"   Gradient frequency: cada {gradient_frequency} batches")
-        logger.info("=" * 60)
+        logger.info(
+            f"Worker ID = {self.worker_id}"
+        )
+
+        logger.info(
+            f"Total Workers = {self.total_workers}"
+        )
+
+        logger.info(
+            f"Chunks asignados = {len(self.assigned_chunks)}"
+        )
+
+        sample_indices = self.get_sample_indices_for_chunks(
+            self.assigned_chunks
+        )
+
+        logger.info(
+            f"Muestras asignadas = {len(sample_indices)}"
+        )
 
     def create_model(self, state_dict=None):
         self.model = EfficientNetLite0(num_classes=self.num_classes).to(self.device)
