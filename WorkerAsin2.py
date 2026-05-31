@@ -240,16 +240,17 @@ async def send_msg(writer, data):
         logger.warning(f"Error enviando mensaje: {e}")
         return False
 
-async def recv_msg(reader, timeout=30.0):
+async def recv_msg(reader, timeout=120.0):
     """
     Recibe un mensaje con length-prefix de 4 bytes (big-endian).
     Lee EXACTAMENTE los bytes indicados - sin sobrelecura del buffer.
     """
+    logger.info(f"RX {length/1024/1024:.2f} MB")
     length_data = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
     length = struct.unpack('>I', length_data)[0]
     if length == 0:
         raise ValueError("Longitud de mensaje es 0")
-    if length > 500_000_000:
+    if length > 100_000_000:
         raise ValueError(f"Mensaje demasiado grande: {length} bytes")
     payload = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
     return pickle.loads(payload)
@@ -264,7 +265,7 @@ class AsyncDataset:
     - Shuffling por epoca para variedad
     """
     def __init__(self, dataset_name='cifar10', data_dir='./data', batch_size=32,
-                 chunk_size=10, worker_id=0, total_workers=1):
+                 chunk_size=10, worker_id=0, total_workers=2):
         self.dataset_name = dataset_name
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -377,7 +378,7 @@ class AsyncWorker:
     """
 
     def __init__(self, server_host='localhost', server_port=5000, num_classes=10,
-                 data_dir='./data', gradient_frequency=2):
+                 data_dir='./data', gradient_frequency=1):
         self.server_host = server_host
         self.server_port = server_port
         self.num_classes = num_classes
@@ -504,7 +505,7 @@ class AsyncWorker:
 
         # Esperar la unica respuesta del servidor: model_update
         try:
-            response = await recv_msg(reader, timeout=60.0)
+            response = await recv_msg(reader, timeout=120.0)
         except asyncio.TimeoutError:
             logger.warning("Timeout esperando model_update del servidor")
             # No limpiar gradientes - reintentar en el proximo ciclo
@@ -571,7 +572,7 @@ class AsyncWorker:
                 return
 
             # --- 2. Recibir configuracion ---
-            response = await recv_msg(reader, timeout=30.0)
+            response = await recv_msg(reader, timeout=60.0)
             if response['type'] != 'assign_id':
                 raise ValueError(f"Se esperaba 'assign_id', recibido: {response['type']}")
 
