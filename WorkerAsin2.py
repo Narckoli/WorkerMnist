@@ -503,53 +503,63 @@ class AsyncWorker:
             logger.error("No se pudo enviar el gradiente al servidor")
             return False
 
-        # Esperar la unica respuesta del servidor: model_update
-        try:
-            response = await recv_msg(reader, timeout=120.0)
-        except asyncio.TimeoutError:
-            logger.warning("Timeout esperando model_update del servidor")
-            # No limpiar gradientes - reintentar en el proximo ciclo
-            return True
-        except (asyncio.IncompleteReadError, ConnectionError) as e:
-            logger.error(f"Conexion perdida esperando model_update: {e}")
-            return False
-
-        msg_type = response.get('type', '')
-
-        if msg_type == 'model_update':
-            new_version = response['model_version']
-            staleness = new_version - self.local_model_version
-            self.staleness_history.append(staleness)
-
-            accepted = response.get('gradient_accepted', True)
-            status = "aceptado" if accepted else "rechazado"
-            logger.info(f"Modelo recibido: v{self.local_model_version} -> v{new_version} "
-                       f"| staleness: {staleness} | gradiente: {status}")
-
-            self.apply_model_update(response['state_dict'])
-            self.local_model_version = new_version
-            self.total_gradients_sent += 1
-            self.zero_accumulated_gradients()
-
-            if response.get('training_done', False):
-                logger.info("Servidor indica: entrenamiento completado!")
+        # Esperar model_update del servidor.
+        # CRITICO: si llega un heartbeat u otro mensaje intermedio NO se debe
+        # retornar — hay que seguir leyendo hasta recibir el model_update real.
+        # Retornar prematuramente deja el model_update sin leer en el stream,
+        # y en la siguiente iteracion sus bytes se interpretan como header de
+        # longitud, corrompiendo todo el framing TCP.
+        while True:
+            try:
+                response = await recv_msg(reader, timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout esperando model_update del servidor")
+                # No limpiar gradientes — el servidor aun puede responder
+                return True
+            except (asyncio.IncompleteReadError, ConnectionError) as e:
+                logger.error(f"Conexion perdida esperando model_update: {e}")
                 return False
 
-            return True
+            msg_type = response.get('type', '')
 
-        elif msg_type == 'training_done':
-            logger.info("Servidor indica: training_done!")
-            return False
+            if msg_type == 'model_update':
+                new_version = response['model_version']
+                staleness = new_version - self.local_model_version
+                self.staleness_history.append(staleness)
 
-        elif msg_type == 'heartbeat':
-            # Heartbeat inesperado en este punto - ignorar y continuar
-            logger.debug(f"Heartbeat recibido durante espera de model_update (version servidor: {response.get('model_version')})")
-            return True
+                accepted = response.get('gradient_accepted', True)
+                status = "aceptado" if accepted else "rechazado"
+                logger.info(f"Modelo recibido: v{self.local_model_version} -> v{new_version} "
+                           f"| staleness: {staleness} | gradiente: {status}")
 
-        else:
-            logger.warning(f"Mensaje inesperado tipo '{msg_type}' - ignorando")
-            self.zero_accumulated_gradients()
-            return True
+                self.apply_model_update(response['state_dict'])
+                self.local_model_version = new_version
+                self.total_gradients_sent += 1
+                self.zero_accumulated_gradients()
+
+                if response.get('training_done', False):
+                    logger.info("Servidor indica: entrenamiento completado!")
+                    return False
+
+                return True
+
+            elif msg_type == 'training_done':
+                logger.info("Servidor indica: training_done!")
+                return False
+
+            elif msg_type == 'heartbeat':
+                # Consumir el heartbeat y seguir esperando el model_update real.
+                # NO retornar: el model_update ya esta en camino y debe ser leido
+                # para mantener el framing del stream sincronizado.
+                logger.debug(f"Heartbeat recibido durante espera de model_update "
+                             f"(version servidor: {response.get('model_version')}) — continuando espera")
+                continue
+
+            else:
+                # Mensaje desconocido: consumirlo y seguir esperando.
+                # Retornar aqui dejaria mensajes sin leer en el buffer.
+                logger.warning(f"Mensaje inesperado tipo '{msg_type}' durante espera de model_update — ignorando y continuando")
+                continue
 
     async def run(self):
         logger.info(f"Conectando a {self.server_host}:{self.server_port}...")
